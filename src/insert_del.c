@@ -43,7 +43,7 @@ DOCA_LOG_REGISTER(FLOW_MTHREAD_ADD_DEL);
 
 /* Keep all queue depth values power of 2 */
 #define HAIRPIN_PIPE_QDEPTH 1024
-#define DROP_PIPE_QDEPTH 1024
+#define DROP_PIPE_QDEPTH 65536
 #define CLASSIFIER_PIPE_QDEPTH 1024
 #define ADD_THREADS 8 // Use only power of 2
 #define MAX_IP_ADDRESSES DROP_PIPE_QDEPTH
@@ -958,40 +958,46 @@ doca_error_t single_core_multi_rule_batch_add_process(struct doca_flow_drop_pipe
 	enum doca_flow_flags_type flags = DOCA_FLOW_WAIT_FOR_BATCH;
 	int num_entries = DROP_PIPE_QDEPTH;
 	double process_execution_time;
+	int num_sub_entries;
 	doca_error_t result;
+	int num_iterations;
 	clock_t start;
 	clock_t end;
-	int i;
+	int i, j;
 
 	pipe_init(pipe);
+	num_iterations = num_entries / 1024; //1024 is nb_queue_depth
+	num_sub_entries = 1024;
 	start = clock();
-	for (i = 0; i < num_entries; i++) {
-		if (i == num_entries - 1)
-			flags = DOCA_FLOW_NO_WAIT;
+	for (j = 0; j < num_iterations; j++) {
+		for (i = 0; i < num_sub_entries; i++) {
+			if (i == num_sub_entries - 1)
+				flags = DOCA_FLOW_NO_WAIT;
 
-                result = add_drop_pipe_entry_no_process(pipe->port, pipe, 0, g_ipv4_addr[pipe->rules_inserted], flags);
-                if (result != DOCA_SUCCESS) {
-                        DOCA_LOG_ERR("Failed to add drop entry %s", doca_error_get_descr(result));
-                        break;
-                }
-		pipe->rules_inserted++;
+			result = add_drop_pipe_entry_no_process(pipe->port, pipe, 0, g_ipv4_addr[pipe->rules_inserted], flags);
+			if (result != DOCA_SUCCESS) {
+				DOCA_LOG_ERR("Failed to add drop entry %s", doca_error_get_descr(result));
+				break;
+			}
+			pipe->rules_inserted++;
 
+		}
+
+		do {
+			result = doca_flow_entries_process(pipe->port,
+							   0,
+							   DEFAULT_TIMEOUT_US,
+							   num_sub_entries - pipe->status.nb_processed);
+			if (result != DOCA_SUCCESS) {
+				DOCA_LOG_ERR("Failed to process entries: %s", doca_error_get_descr(result));
+				return result;
+			}
+			if (pipe->status.failure) {
+				DOCA_LOG_ERR("Failed to process entries, status is not success");
+				return DOCA_ERROR_BAD_STATE;
+			}
+		} while (pipe->status.nb_processed < num_sub_entries);
 	}
-
-	do {
-                result = doca_flow_entries_process(pipe->port,
-                                                   0,
-                                                   DEFAULT_TIMEOUT_US,
-                                                   num_entries - pipe->status.nb_processed);
-                if (result != DOCA_SUCCESS) {
-                        DOCA_LOG_ERR("Failed to process entries: %s", doca_error_get_descr(result));
-                        return result;
-                }
-                if (pipe->status.failure) {
-                        DOCA_LOG_ERR("Failed to process entries, status is not success");
-                        return DOCA_ERROR_BAD_STATE;
-                }
-        } while (pipe->status.nb_processed < num_entries);
 	end = clock();
 	process_execution_time = (double)(end - start) / CLOCKS_PER_SEC;
 	DOCA_LOG_INFO("Batch Add/process %d entries from core %d in %f seconds", pipe->rules_inserted, sched_getcpu(), process_execution_time);
@@ -1001,43 +1007,49 @@ doca_error_t single_core_multi_rule_batch_add_process(struct doca_flow_drop_pipe
 
 doca_error_t single_core_multi_rule_batch_remove_process(struct doca_flow_drop_pipe *pipe)
 {
-        doca_error_t result;
+        enum doca_flow_flags_type flags = DOCA_FLOW_WAIT_FOR_BATCH;
         int num_entries = DROP_PIPE_QDEPTH;
         double execution_time;
+        doca_error_t result;
+	int num_sub_entries;
+	int num_iterations;
         clock_t start;
         clock_t end;
-        int i;
-        enum doca_flow_flags_type flags = DOCA_FLOW_WAIT_FOR_BATCH;
+        int i, j;
 
         pipe_init(pipe);
+	num_iterations = num_entries / 1024; //1024 is nb_queue_depth
+	num_sub_entries = 1024;
         start = clock();
-        for (i = 0; i < num_entries; i++) {
-                if (i == num_entries - 1)
-                        flags = DOCA_FLOW_NO_WAIT;
+	for (j = 0; j < num_iterations; j++) {
+		for (i = 0; i < num_sub_entries; i++) {
+			if (i == num_sub_entries - 1)
+				flags = DOCA_FLOW_NO_WAIT;
 
-		memset(&pipe->status, 0 , sizeof(pipe->status));
-                result = remove_drop_pipe_entry_no_process(0, pipe, flags);
-                if (result != DOCA_SUCCESS) {
-                        DOCA_LOG_ERR("Failed to add drop entry %s", doca_error_get_descr(result));
-                        break;
-                }
-		pipe->rules_deleted++;
+			memset(&pipe->status, 0 , sizeof(pipe->status));
+			result = remove_drop_pipe_entry_no_process(0, pipe, flags);
+			if (result != DOCA_SUCCESS) {
+				DOCA_LOG_ERR("Failed to add drop entry %s", doca_error_get_descr(result));
+				break;
+			}
+			pipe->rules_deleted++;
 
-        }
+		}
 
-        do {
-		memset(&pipe->status, 0 , sizeof(pipe->status));
-                result = doca_flow_entries_process(pipe->port,
-                                                   0,
-                                                   DEFAULT_TIMEOUT_US,
-                                                   num_entries - pipe->status.nb_processed);
-                if (result != DOCA_SUCCESS) {
-                        DOCA_LOG_ERR("Failed to process entries: %s", doca_error_get_descr(result));
-                        return result;
-                }
-		/* TODO Check why status.failure is 1 only for batch delete */
+		do {
+			memset(&pipe->status, 0 , sizeof(pipe->status));
+			result = doca_flow_entries_process(pipe->port,
+							   0,
+							   DEFAULT_TIMEOUT_US,
+							   num_sub_entries - pipe->status.nb_processed);
+			if (result != DOCA_SUCCESS) {
+				DOCA_LOG_ERR("Failed to process entries: %s", doca_error_get_descr(result));
+				return result;
+			}
+			/* TODO Check why status.failure is 1 only for batch delete */
 
-        } while (pipe->status.nb_processed < num_entries);
+		} while (pipe->status.nb_processed < num_sub_entries);
+	}
         end = clock();
         execution_time = (double)(end - start) / CLOCKS_PER_SEC;
         DOCA_LOG_INFO("Batch remove/process of %d entries from core %d in %f seconds", pipe->rules_deleted, sched_getcpu(), execution_time);
@@ -1180,7 +1192,6 @@ doca_error_t flow_mthread_add_del(int nb_queues)
 		DOCA_LOG_ERR("all_threads_cancel_wait failed with err %d", ret);
 		goto end;
 	}
-
 	/* Single core, multiple rules, batch add */
 	result = single_core_multi_rule_batch_add_process(&drop_pipe[0]);
 	if (result != DOCA_SUCCESS) {
