@@ -36,17 +36,18 @@
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "flow_common.h"
 
 DOCA_LOG_REGISTER(FLOW_MTHREAD_ADD_DEL);
 
+/* Keep all queue depth values power of 2 */
 #define HAIRPIN_PIPE_QDEPTH 1024
 #define DROP_PIPE_QDEPTH 1024
 #define CLASSIFIER_PIPE_QDEPTH 1024
-#define ADD_THREADS 4
-#define LOOP_COUNT 1
+#define ADD_THREADS 8 // Use only power of 2
+#define MAX_IP_ADDRESSES DROP_PIPE_QDEPTH
+#define MAX_IP_LENGTH 16       // Maximum length of an IPv4 address (xxx.xxx.xxx.xxx)
 
 int g_lcore_count;
 
@@ -73,12 +74,20 @@ struct doca_flow_drop_pipe {
 	int core_count;
 	int rules_inserted;
 	int rules_deleted;
-	int first;
-	int last;
 };
 	
 pthread_t g_rule_del_thread[ADD_THREADS];
 pthread_t g_rule_add_thread[ADD_THREADS];
+doca_be32_t g_ipv4_addr[MAX_IP_ADDRESSES];
+
+void generate_random_ip(doca_be32_t *ip)
+{
+	uint8_t octet1 = rand() % 256;
+	uint8_t octet2 = rand() % 256;
+	uint8_t octet3 = rand() % 256;
+	uint8_t octet4 = rand() % 256;
+	*ip = BE_IPV4_ADDR(octet1, octet2, octet3, octet4);
+}
 
 /*
  * Create DOCA Flow pipe that forwards all the traffic to the other port
@@ -451,16 +460,14 @@ static void hairpin_pipe_destroy(struct doca_flow_pipe *pipe)
 
 static doca_error_t add_drop_pipe_entry(struct doca_flow_port *port,
 					struct doca_flow_drop_pipe *pipe,
-					int queue_id,
-					int first,
-					int last)
+					int queue_id, doca_be32_t ipv4_addr)
 {
 	struct doca_flow_actions actions;
 	struct doca_flow_match match;
 	doca_error_t result;
 
 	/* example 5-tuple to drop explicitly */
-	doca_be32_t dst_ip_addr = BE_IPV4_ADDR(first, 8, 8, last);
+	doca_be32_t dst_ip_addr = ipv4_addr;
 	doca_be32_t src_ip_addr = BE_IPV4_ADDR(1, 2, 3, 4);
 	doca_be16_t dst_port = rte_cpu_to_be_16(80);
 	doca_be16_t src_port = rte_cpu_to_be_16(1234);
@@ -500,7 +507,7 @@ static doca_error_t add_drop_pipe_entry(struct doca_flow_port *port,
 static doca_error_t
 add_drop_pipe_entry_no_process(struct doca_flow_port *port,
 			       struct doca_flow_drop_pipe *pipe,
-			       int queue_id, int first, int last,
+			       int queue_id, doca_be32_t ipv4_addr,
 			       int flags)
 {
 	struct doca_flow_actions actions;
@@ -508,7 +515,7 @@ add_drop_pipe_entry_no_process(struct doca_flow_port *port,
 	doca_error_t result;
 
 	/* example 5-tuple to drop explicitly */
-	doca_be32_t dst_ip_addr = BE_IPV4_ADDR(first, 8, 8, last);
+	doca_be32_t dst_ip_addr = ipv4_addr;
 	doca_be32_t src_ip_addr = BE_IPV4_ADDR(1, 2, 3, 4);
 	doca_be16_t dst_port = rte_cpu_to_be_16(80);
 	doca_be16_t src_port = rte_cpu_to_be_16(1234);
@@ -570,13 +577,17 @@ remove_drop_pipe_entry(int queue_id, struct doca_flow_drop_pipe *pipe)
 void *drop_rule_add(void *arg)
 {
 	struct doca_flow_drop_pipe *pipe = (struct doca_flow_drop_pipe *)arg;
+	int entries_to_post_per_thread;
 	doca_error_t result;
+	int arr_start_idx;
 	cpu_set_t cpuset;
 	int cpu;
 
 	/* Set Affinity of this thread */
 	pthread_mutex_lock(&pipe->mutex);
 	cpu = pipe->core_count % g_lcore_count;
+	entries_to_post_per_thread = MAX_IP_ADDRESSES / ADD_THREADS;
+	arr_start_idx =  entries_to_post_per_thread * cpu;
 	CPU_ZERO(&cpuset);
 	CPU_SET(cpu, &cpuset);
 	pipe->core_count++;
@@ -599,7 +610,7 @@ void *drop_rule_add(void *arg)
 		}
 
 		/* Insert drop rule */
-		result = add_drop_pipe_entry(pipe->port, pipe, 0, pipe->first, pipe->last);
+		result = add_drop_pipe_entry(pipe->port, pipe, 0, g_ipv4_addr[arr_start_idx]);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to add drop entry %s", doca_error_get_descr(result));
 			pthread_mutex_unlock(&pipe->mutex);
@@ -607,16 +618,10 @@ void *drop_rule_add(void *arg)
 		}
 
 		pipe->rules_inserted++;
-		pipe->last++;
-		if (pipe->last >= 255) {
-			pipe->last = 1;
-			pipe->first += 1;
-		}
-		
-		if (pipe->first >= 255)
-			pipe->first = 1;
+		arr_start_idx++;
 		pthread_mutex_unlock(&pipe->mutex);
-
+		if (arr_start_idx == entries_to_post_per_thread - 1)
+			break;
 		pthread_testcancel();
 	}
 	return NULL;
@@ -672,8 +677,6 @@ void pipe_init(struct doca_flow_drop_pipe *pipe)
 	pipe->core_count = 0;
 	pipe->rules_inserted = 0;
 	pipe->rules_deleted = 0;
-	pipe->first = 1; //1.x.x.x
-	pipe->last = 1; //x.x.x.1
 }
 
 void rule_add_wait(struct doca_flow_drop_pipe *pipe)
@@ -777,8 +780,7 @@ doca_error_t single_core_post_process(struct doca_flow_drop_pipe *pipe)
 	pipe_init(pipe);
 
 	start = clock();
-	result = add_drop_pipe_entry(pipe->port, pipe, 0, pipe->first,
-				     pipe->last);
+	result = add_drop_pipe_entry(pipe->port, pipe, 0, g_ipv4_addr[0]);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to add drop entry %s", doca_error_get_descr(result));
 		return result;
@@ -829,22 +831,13 @@ doca_error_t single_core_multi_rule_single_post_process(struct doca_flow_drop_pi
 		}
 
 		/* Insert drop rule */
-		result = add_drop_pipe_entry(pipe->port, pipe, 0, pipe->first,
-					     pipe->last);
+		result = add_drop_pipe_entry(pipe->port, pipe, 0, g_ipv4_addr[pipe->rules_inserted]);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to add drop entry %s", doca_error_get_descr(result));
 			break;
 		}
 
 		pipe->rules_inserted++;
-		pipe->last++;
-		if (pipe->last >= 255) {
-			pipe->last = 1;
-			pipe->first += 1;
-		}
-
-		if (pipe->first >= 255)
-			pipe->first = 1;
 	}
 
 	end = clock();
@@ -878,14 +871,6 @@ doca_error_t single_core_multi_rule_single_remove_process(struct doca_flow_drop_
 		}
 
 		pipe->rules_deleted++;
-		pipe->last++;
-		if (pipe->last >= 255) {
-			pipe->last = 1;
-			pipe->first += 1;
-		}
-
-		if (pipe->first >= 255)
-			pipe->first = 1;
 	}
 
 	end = clock();
@@ -919,7 +904,7 @@ int multi_core_multi_rule_single_post_process(struct doca_flow_drop_pipe *pipe)
 	rule_add_wait(pipe);
 	end = clock();
 	execution_time = (double)(end - start) / CLOCKS_PER_SEC;
-	DOCA_LOG_ERR("Multi core insertion for %d entries took %f seconds", pipe->rules_inserted + 1, execution_time);
+	DOCA_LOG_ERR("Multi core insertion (%d threads) for %d entries took %f seconds", ADD_THREADS, pipe->rules_inserted + 1, execution_time);
 	pthread_mutex_destroy(&pipe->mutex);
 	return ret;
 }
@@ -946,20 +931,20 @@ int multi_core_multi_rule_single_remove_process(struct doca_flow_drop_pipe *pipe
 	rule_del_wait(pipe);
 	end = clock();
 	execution_time = (double)(end - start) / CLOCKS_PER_SEC;
-	DOCA_LOG_ERR("Multi core deletion for %d entries took %f seconds", pipe->rules_deleted + 1, execution_time);
+	DOCA_LOG_ERR("Multi core deletion (%d threads) for %d entries took %f seconds", ADD_THREADS, pipe->rules_deleted + 1, execution_time);
 	pthread_mutex_destroy(&pipe->mutex);
 	return ret;
 }
 
 doca_error_t single_core_multi_rule_batch_add_process(struct doca_flow_drop_pipe *pipe)
 {
-	doca_error_t result;
+	enum doca_flow_flags_type flags = DOCA_FLOW_WAIT_FOR_BATCH;
 	int num_entries = DROP_PIPE_QDEPTH;
 	double process_execution_time;
+	doca_error_t result;
 	clock_t start;
 	clock_t end;
 	int i;
-	enum doca_flow_flags_type flags = DOCA_FLOW_WAIT_FOR_BATCH;
 
 	pipe_init(pipe);
 	start = clock();
@@ -967,7 +952,7 @@ doca_error_t single_core_multi_rule_batch_add_process(struct doca_flow_drop_pipe
 		if (i == num_entries - 1)
 			flags = DOCA_FLOW_NO_WAIT;
 
-                result = add_drop_pipe_entry_no_process(pipe->port, pipe, 0, pipe->first, pipe->last, flags);
+                result = add_drop_pipe_entry_no_process(pipe->port, pipe, 0, g_ipv4_addr[pipe->rules_inserted], flags);
                 if (result != DOCA_SUCCESS) {
                         DOCA_LOG_ERR("Failed to add drop entry %s", doca_error_get_descr(result));
                         break;
@@ -1107,6 +1092,10 @@ doca_error_t flow_mthread_add_del(int nb_queues)
 		}
 	}
 
+	/* Generate and save all IP address in array */
+	for (int i = 0; i < MAX_IP_ADDRESSES;  i++)
+		generate_random_ip(&g_ipv4_addr[i]);
+
 	/* single core, single rule add */
 	result = single_core_post_process(&drop_pipe[0]);
 	if (result != DOCA_SUCCESS) {
@@ -1149,6 +1138,19 @@ doca_error_t flow_mthread_add_del(int nb_queues)
 		goto end;
 	}
 
+	ret = all_threads_cancel();
+	if (ret) {
+		DOCA_LOG_ERR("all_threads_cancel failed with err %d", ret);
+		goto end;
+	}
+
+	/* Wait for the thread to complete */
+	ret = all_threads_cancel_wait();
+	if (ret) {
+		DOCA_LOG_ERR("all_threads_cancel_wait failed with err %d", ret);
+		goto end;
+	}
+
 	/* Single core, multiple rules, batch add */
 	result = single_core_multi_rule_batch_add_process(&drop_pipe[0]);
 	if (result != DOCA_SUCCESS) {
@@ -1160,19 +1162,6 @@ doca_error_t flow_mthread_add_del(int nb_queues)
 	result = single_core_multi_rule_batch_remove_process(&drop_pipe[0]);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("single_core_multi_rule_batch_remove_process failed with error %s", doca_error_get_descr(result));
-		goto end;
-	}
-
-	ret = all_threads_cancel();
-	if (ret) {
-		DOCA_LOG_ERR("all_threads_cancel failed with err %d", ret);
-		goto end;
-	}
-
-	/* Wait for the thread to complete */
-	ret = all_threads_cancel_wait();
-	if (ret) {
-		DOCA_LOG_ERR("all_threads_cancel_wait failed with err %d", ret);
 		goto end;
 	}
 
