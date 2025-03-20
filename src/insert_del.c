@@ -935,6 +935,8 @@ int multi_core_multi_rule_single_remove_process(struct doca_flow_drop_pipe *pipe
 
 	/* Init mutex */
 	pthread_mutex_init(&pipe->mutex, NULL);
+	
+	pipe_init(pipe);
 
 	/* Spawn thread to add rules */
 	start = clock();
